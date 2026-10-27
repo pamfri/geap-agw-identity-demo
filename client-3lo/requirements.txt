@@ -1,0 +1,5 @@
+fastapi>=0.110.0
+uvicorn>=0.30.0
+requests>=2.31.0
+google-auth>=2.35.0
+google-cloud-aiplatform[agent_engines,adk]>=1.112.0

@@ -1,0 +1,32 @@
+# Python bytecode & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# Generated runtime SPIFFE identities & local environment secrets
+.env
+*.env
+!*.env.example
+agents/spiffe_identities.env
+
+# Terraform state & sensitive variable files
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfvars
+!*.tfvars.example
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# macOS / IDE files
+.DS_Store
+.idea/
+.vscode/
