@@ -5,7 +5,6 @@ set -euo pipefail
 # 0. ENVIRONMENT VARIABLES (Loads .env if present; defaults to placeholders)
 # ==============================================================================
 SCRIPT_PATH="${BASH_SOURCE[0]}"
-cd /tmp
 if [[ "${SCRIPT_PATH}" = /* ]]; then
   SCRIPT_DIR="$(dirname "${SCRIPT_PATH}")"
 else
@@ -15,6 +14,7 @@ ROOT_DIR="$(dirname "${SCRIPT_DIR}")"
 if [[ -f "${ROOT_DIR}/.env" ]]; then
   source "${ROOT_DIR}/.env"
 fi
+cd "${TMPDIR:-/tmp}"
 
 export REGION="${REGION:-us-central1}"
 export PROJECT_A_ID="${PROJECT_A_ID:-your-project-a-id}"

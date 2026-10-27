@@ -11,6 +11,12 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+
+_SCRIPT_ABS_PATH = os.path.abspath(__file__)
+ORIG_AGENTS_DIR = os.path.dirname(_SCRIPT_ABS_PATH)
+REPO_ROOT_DIR = os.path.dirname(ORIG_AGENTS_DIR)
+_TMP_ROOT = tempfile.gettempdir()
 
 try:
     if sys.version_info < (3, 10):
@@ -24,7 +30,7 @@ except ModuleNotFoundError:
         os.path.expanduser("~/.cache/agw-venv-py311/bin/python3"),
         os.path.expanduser("~/.cache/agw-venv/bin/python3"),
         os.path.expanduser("~/agw-venv/bin/python3"),
-        "/tmp/agw-venv/bin/python3",
+        os.path.join(_TMP_ROOT, "agw-venv/bin/python3"),
     ]
     for _venv_py in _venv_candidates:
         if os.path.exists(_venv_py) and os.path.realpath(sys.executable) != os.path.realpath(_venv_py):
@@ -35,7 +41,7 @@ except ModuleNotFoundError:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-                os.execv(_venv_py, [_venv_py, *sys.argv])
+                os.execv(_venv_py, [_venv_py, _SCRIPT_ABS_PATH, *sys.argv[1:]])
             except Exception:
                 pass
 
@@ -43,8 +49,9 @@ except ModuleNotFoundError:
 
     _py_candidates = (
         [
-            "/opt/homebrew/bin/python3",
+            "/usr/bin/python3",
             "/usr/local/bin/python3",
+            "/opt/homebrew/bin/python3",
         ]
         + glob.glob("/opt/homebrew/opt/python@3.*/bin/python3*")
         + glob.glob("/opt/homebrew/Cellar/python@3.*/*/bin/python3*")
@@ -65,7 +72,7 @@ except ModuleNotFoundError:
                 except Exception:
                     pass
     if not _base_py:
-        raise RuntimeError("Python >= 3.10 is required. Please run with /opt/homebrew/bin/python3")
+        raise RuntimeError("Python >= 3.10 is required.")
 
     _py_ver = subprocess.check_output(
         [_base_py, "-c", "import sys; print(f'{sys.version_info.major}{sys.version_info.minor}')"],
@@ -119,11 +126,8 @@ except ModuleNotFoundError:
         [_venv_py, "-m", "pip", "install", "--only-binary=:all:", "--no-deps", "google-adk==1.39.1"],
         check=True,
     )
-    os.execv(_venv_py, [_venv_py, *sys.argv])
+    os.execv(_venv_py, [_venv_py, _SCRIPT_ABS_PATH, *sys.argv[1:]])
 
-os.chdir("/tmp")
-ORIG_AGENTS_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT_DIR = os.path.dirname(ORIG_AGENTS_DIR)
 _dotenv_path = os.path.join(REPO_ROOT_DIR, ".env")
 if os.path.isfile(_dotenv_path):
     with open(_dotenv_path, "r", encoding="utf-8") as _ef:
@@ -139,7 +143,7 @@ if os.path.isfile(_dotenv_path):
                 _v = _v.strip().strip('"').strip("'")
                 os.environ.setdefault(_k, _v)
 
-AGENTS_DIR = "/tmp/agw-cfg/agents_build"
+AGENTS_DIR = os.path.join(_TMP_ROOT, "agw-cfg", "agents_build")
 os.makedirs(AGENTS_DIR, exist_ok=True)
 for pkg_dir in ("agent1_github_secops", "agent2_internal_sre"):
     src_pkg = os.path.join(ORIG_AGENTS_DIR, pkg_dir)

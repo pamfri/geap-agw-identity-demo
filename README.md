@@ -99,7 +99,7 @@ source .env
 Run `agents/deploy_agents.py` (which automatically reads `.env` at the repo root) to provision both agents on Vertex AI Agent Engine with `IdentityType.AGENT_IDENTITY` and `agent_gateway_config`, write their SPIFFE principals to `agents/spiffe_identities.env`, and execute live smoke tests:
 
 ```bash
-cd /tmp && /opt/homebrew/bin/python3 /path/to/secops-agw-spiffe/agents/deploy_agents.py
+python3 agents/deploy_agents.py
 ```
 
 ### Step 3: Bind Provisioned SPIFFE Principals to IAP v2 & Auth Manager
