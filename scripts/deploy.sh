@@ -25,6 +25,7 @@ export PROJECT_B_ID="${PROJECT_B_ID:-your-project-b-id}"
 export GITHUB_OAUTH_CLIENT_ID="${GITHUB_OAUTH_CLIENT_ID:-}"
 export GITHUB_OAUTH_CLIENT_SECRET="${GITHUB_OAUTH_CLIENT_SECRET:-}"
 export OAUTH_CONTINUE_URI="${OAUTH_CONTINUE_URI:-http://localhost:8501/validateUserId}"
+export AZURE_MCP_URL="${AZURE_MCP_URL:-https://your-azure-mcp-app.azurewebsites.net/runtime/webhooks/mcp}"
 
 mkdir -p /tmp/agw-cfg
 
@@ -71,6 +72,9 @@ if ! gcloud network-services agent-gateways describe enterprise-egress-agw --pro
   gcloud services enable \
     agentregistry.googleapis.com \
     aiplatform.googleapis.com \
+    apphub.googleapis.com \
+    apptopology.googleapis.com \
+    cloudasset.googleapis.com \
     cloudresourcemanager.googleapis.com \
     cloudtrace.googleapis.com \
     compute.googleapis.com \
@@ -83,10 +87,12 @@ if ! gcloud network-services agent-gateways describe enterprise-egress-agw --pro
   gcloud services enable \
     iap.googleapis.com \
     logging.googleapis.com \
+    modelarmor.googleapis.com \
     monitoring.googleapis.com \
     networksecurity.googleapis.com \
     networkservices.googleapis.com \
     observability.googleapis.com \
+    securitycenter.googleapis.com \
     serviceextensions.googleapis.com \
     serviceusage.googleapis.com \
     storage.googleapis.com \
@@ -96,18 +102,26 @@ if ! gcloud network-services agent-gateways describe enterprise-egress-agw --pro
   echo "Enabling Agent Identity API (agentidentity.googleapis.com) in Project A..."
   gcloud services enable agentidentity.googleapis.com --project="${PROJECT_A_ID}" || true
 
-  echo "Upgrading Project A _Default log bucket to Log Analytics (required for Agent Gateway Observability UI)..."
+  echo "Upgrading Project A & Project B _Default log buckets to Log Analytics (required for Agent Gateway Observability & Anomaly Detection UI)..."
   gcloud logging buckets update _Default \
     --location=global \
     --enable-analytics \
     --async \
     --project="${PROJECT_A_ID}" 2>/dev/null || true
+  gcloud logging buckets update _Default \
+    --location=global \
+    --enable-analytics \
+    --async \
+    --project="${PROJECT_B_ID}" 2>/dev/null || true
 
   echo "Enabling APIs in Project B (${PROJECT_B_ID}) — Batch 1/2..."
   gcloud services enable \
     agentregistry.googleapis.com \
     aiplatform.googleapis.com \
+    apphub.googleapis.com \
+    apptopology.googleapis.com \
     artifactregistry.googleapis.com \
+    cloudasset.googleapis.com \
     cloudbuild.googleapis.com \
     cloudresourcemanager.googleapis.com \
     cloudtrace.googleapis.com \
@@ -120,14 +134,33 @@ if ! gcloud network-services agent-gateways describe enterprise-egress-agw --pro
     iam.googleapis.com \
     iamcredentials.googleapis.com \
     logging.googleapis.com \
+    modelarmor.googleapis.com \
     monitoring.googleapis.com \
     networkservices.googleapis.com \
+    observability.googleapis.com \
     run.googleapis.com \
+    securitycenter.googleapis.com \
     storage.googleapis.com \
     telemetry.googleapis.com \
     --project="${PROJECT_B_ID}"
 else
-  echo "APIs and Agent Gateway already initialized; skipping API enablement batches."
+  echo "APIs and Agent Gateway already initialized; ensuring Model Armor, App Topology & SCC APIs are enabled..."
+  gcloud services enable \
+    apphub.googleapis.com \
+    apptopology.googleapis.com \
+    cloudasset.googleapis.com \
+    modelarmor.googleapis.com \
+    observability.googleapis.com \
+    securitycenter.googleapis.com \
+    --project="${PROJECT_A_ID}" >/dev/null 2>&1 || true
+  gcloud services enable \
+    apphub.googleapis.com \
+    apptopology.googleapis.com \
+    cloudasset.googleapis.com \
+    modelarmor.googleapis.com \
+    observability.googleapis.com \
+    securitycenter.googleapis.com \
+    --project="${PROJECT_B_ID}" >/dev/null 2>&1 || true
 fi
 
 # ==============================================================================
@@ -216,9 +249,13 @@ CURRENT_MCP_MODE=$(gcloud run services describe internal-mcp-server \
   --project="${PROJECT_B_ID}" \
   --region="${REGION}" \
   --format="value(spec.template.spec.containers[0].env)" 2>/dev/null || true)
+CURRENT_MCP_FUNC_TYPE=$(gcloud run services describe internal-mcp-server \
+  --project="${PROJECT_B_ID}" \
+  --region="${REGION}" \
+  --format="value(metadata.annotations['apphub.cloud.google.com/functional-type'])" 2>/dev/null || true)
 
-if [[ "${CURRENT_MCP_MODE}" != *"stateless-json-v2"* ]]; then
-  echo "Deploying/Updating Private SecOps Cloud Run MCP Server (stateless JSON HTTP) in Project B (${PROJECT_B_ID})..."
+if [[ "${CURRENT_MCP_MODE}" != *"stateless-json-v2"* || "${CURRENT_MCP_FUNC_TYPE}" != "mcp-server" ]]; then
+  echo "Deploying/Updating Private SecOps Cloud Run MCP Server (--functional-type=mcp-server, stateless JSON HTTP) in Project B (${PROJECT_B_ID})..."
   gcloud projects add-iam-policy-binding "${PROJECT_B_ID}" \
     --member="serviceAccount:${PROJECT_B_NUM}-compute@developer.gserviceaccount.com" \
     --role="roles/run.builder" --quiet >/dev/null
@@ -226,21 +263,39 @@ if [[ "${CURRENT_MCP_MODE}" != *"stateless-json-v2"* ]]; then
   rm -rf /tmp/agw-cfg/mcp-server
   cp -R "${ROOT_DIR}/mcp-server" /tmp/agw-cfg/mcp-server
 
+  if [[ -n "${CURRENT_MCP_MODE}" && -z "${CURRENT_MCP_FUNC_TYPE}" ]]; then
+    echo "  -> Recreating 'internal-mcp-server' once to set immutable --functional-type=mcp-server annotation for Agent Registry auto-discovery..."
+    gcloud -q run services delete internal-mcp-server \
+      --project="${PROJECT_B_ID}" \
+      --region="${REGION}" >/dev/null 2>&1 || true
+  fi
+
+  gcloud -q beta run deploy internal-mcp-server \
+    --project="${PROJECT_B_ID}" \
+    --region="${REGION}" \
+    --source="/tmp/agw-cfg/mcp-server" \
+    --ingress=internal \
+    --no-invoker-iam-check \
+    --functional-type=mcp-server \
+    --min-instances=1 \
+    --set-env-vars="MCP_TRANSPORT_MODE=stateless-json-v2,PROJECT_A_ID=${PROJECT_A_ID},PROJECT_B_ID=${PROJECT_B_ID}" || \
   gcloud -q run deploy internal-mcp-server \
     --project="${PROJECT_B_ID}" \
     --region="${REGION}" \
     --source="/tmp/agw-cfg/mcp-server" \
     --ingress=internal \
     --no-invoker-iam-check \
+    --update-annotations="apphub.cloud.google.com/functional-type=mcp-server" \
     --min-instances=1 \
-    --set-env-vars="MCP_TRANSPORT_MODE=stateless-json-v2"
+    --set-env-vars="MCP_TRANSPORT_MODE=stateless-json-v2,PROJECT_A_ID=${PROJECT_A_ID},PROJECT_B_ID=${PROJECT_B_ID}"
 else
-  echo "  -> Cloud Run service 'internal-mcp-server' (stateless-json-v2) is already deployed and serving."
+  echo "  -> Cloud Run service 'internal-mcp-server' (stateless-json-v2, functional-type=mcp-server) is already deployed and serving."
   gcloud -q run services update internal-mcp-server \
     --project="${PROJECT_B_ID}" \
     --region="${REGION}" \
     --no-invoker-iam-check \
-    --min-instances=1 >/dev/null 2>&1 || true
+    --min-instances=1 \
+    --update-env-vars="PROJECT_A_ID=${PROJECT_A_ID},PROJECT_B_ID=${PROJECT_B_ID}" >/dev/null 2>&1 || true
 fi
 
 export INTERNAL_MCP_URL=$(gcloud run services describe internal-mcp-server \
@@ -254,32 +309,58 @@ echo "  -> Regional Cloud Run MCP URL: ${INTERNAL_MCP_REGIONAL_URL}/mcp"
 # ==============================================================================
 # 4. PROJECT A: DEPLOY CLOUD RUN 3LO CALLBACK SERVICE & 3LO AUTH PROVIDER
 # ==============================================================================
-echo "Deploying Production 3LO Callback Service ('secops-3lo-callback') on Cloud Run in Project A (${PROJECT_A_ID})..."
-gcloud services enable compute.googleapis.com run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com \
-  --project="${PROJECT_A_ID}" >/dev/null 2>&1 || true
-
-for build_svc in compute.googleapis.com run.googleapis.com cloudbuild.googleapis.com; do
-  gcloud -q beta services identity create --service="${build_svc}" --project="${PROJECT_A_ID}" >/dev/null 2>&1 || true
-done
-
-for cb_role in roles/run.builder roles/cloudbuild.builds.builder roles/storage.objectAdmin roles/artifactregistry.writer roles/logging.logWriter roles/agentidentity.user roles/aiplatform.user roles/serviceusage.serviceUsageConsumer; do
-  gcloud projects add-iam-policy-binding "${PROJECT_A_ID}" \
-    --member="serviceAccount:${PROJECT_A_NUM}-compute@developer.gserviceaccount.com" \
-    --role="${cb_role}" --quiet >/dev/null
-done
-
-rm -rf /tmp/agw-cfg/client-3lo
-cp -R "${ROOT_DIR}/client-3lo" /tmp/agw-cfg/client-3lo
-
-gcloud -q run deploy secops-3lo-callback \
+echo "Checking Production 3LO Callback Service ('secops-3lo-callback') on Cloud Run in Project A (${PROJECT_A_ID})..."
+CURRENT_3LO_URL=$(gcloud run services describe secops-3lo-callback \
   --project="${PROJECT_A_ID}" \
   --region="${REGION}" \
-  --source="/tmp/agw-cfg/client-3lo" \
-  --ingress=all \
-  --no-invoker-iam-check \
-  --min-instances=1 \
-  --max-instances=1 \
-  --set-env-vars="PROJECT_A_ID=${PROJECT_A_ID},PROJECT_A_NUM=${PROJECT_A_NUM},REGION=${REGION}"
+  --format="value(status.url)" 2>/dev/null || true)
+
+if [[ -z "${CURRENT_3LO_URL}" || "${FORCE_REBUILD_3LO:-false}" == "true" ]]; then
+  echo "Deploying Production 3LO Callback Service ('secops-3lo-callback') on Cloud Run in Project A (${PROJECT_A_ID})..."
+  gcloud services enable compute.googleapis.com run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com \
+    --project="${PROJECT_A_ID}" >/dev/null 2>&1 || true
+
+  for build_svc in compute.googleapis.com run.googleapis.com cloudbuild.googleapis.com; do
+    gcloud -q beta services identity create --service="${build_svc}" --project="${PROJECT_A_ID}" >/dev/null 2>&1 || true
+  done
+
+  for cb_role in roles/run.builder roles/cloudbuild.builds.builder roles/storage.objectAdmin roles/artifactregistry.writer roles/logging.logWriter roles/serviceusage.serviceUsageConsumer; do
+    gcloud projects add-iam-policy-binding "${PROJECT_A_ID}" \
+      --member="serviceAccount:${PROJECT_A_NUM}-compute@developer.gserviceaccount.com" \
+      --role="${cb_role}" --quiet >/dev/null
+  done
+
+  # Create dedicated least-privilege runtime service account for secops-3lo-callback
+  # so it does NOT run as the Default Compute Service Account in Security Command Center
+  CALLBACK_SA_NAME="sa-3lo-callback"
+  CALLBACK_SA_EMAIL="${CALLBACK_SA_NAME}@${PROJECT_A_ID}.iam.gserviceaccount.com"
+  gcloud iam service-accounts describe "${CALLBACK_SA_EMAIL}" --project="${PROJECT_A_ID}" >/dev/null 2>&1 || \
+    gcloud iam service-accounts create "${CALLBACK_SA_NAME}" \
+      --display-name="Least-Privilege 3LO OAuth Callback Runtime SA" \
+      --project="${PROJECT_A_ID}" >/dev/null 2>&1 || true
+
+  for runtime_role in roles/agentidentity.user roles/logging.logWriter; do
+    gcloud projects add-iam-policy-binding "${PROJECT_A_ID}" \
+      --member="serviceAccount:${CALLBACK_SA_EMAIL}" \
+      --role="${runtime_role}" --quiet >/dev/null
+  done
+
+  rm -rf /tmp/agw-cfg/client-3lo
+  cp -R "${ROOT_DIR}/client-3lo" /tmp/agw-cfg/client-3lo
+
+  gcloud -q run deploy secops-3lo-callback \
+    --project="${PROJECT_A_ID}" \
+    --region="${REGION}" \
+    --source="/tmp/agw-cfg/client-3lo" \
+    --service-account="${CALLBACK_SA_EMAIL}" \
+    --ingress=all \
+    --no-invoker-iam-check \
+    --min-instances=1 \
+    --max-instances=1 \
+    --set-env-vars="PROJECT_A_ID=${PROJECT_A_ID},PROJECT_A_NUM=${PROJECT_A_NUM},REGION=${REGION}"
+else
+  echo "  -> Cloud Run service 'secops-3lo-callback' is already deployed (${CURRENT_3LO_URL})."
+fi
 
 export CALLBACK_SERVICE_URL=$(gcloud run services describe secops-3lo-callback \
   --project="${PROJECT_A_ID}" \
@@ -460,13 +541,159 @@ gcloud -q network-security authz-policies import enterprise-egress-agw-authz-pol
   --source="/tmp/agw-cfg/iap-v2-authz-policy.yaml"
 
 # ==============================================================================
+# 5B. PROJECT A & B: MODEL ARMOR INLINE GUARDRAILS (CONTENT_AUTHZ + FLOOR SETTINGS) & TELEMETRY POLICY
+# ==============================================================================
+echo "Configuring Model Armor Inline Guardrails ('secops-agent-guardrail'), Vertex AI Floor Settings & Cloud Trace TelemetryPolicy..."
+for ma_proj in "${PROJECT_A_ID}" "${PROJECT_B_ID}"; do
+  gcloud -q beta services identity create --service=modelarmor.googleapis.com --project="${ma_proj}" >/dev/null 2>&1 || true
+done
+
+for dep_sa_num in "${PROJECT_A_NUM}" "${PROJECT_B_NUM}"; do
+  for ma_sa in \
+    "serviceAccount:service-${dep_sa_num}@gcp-sa-aiplatform.iam.gserviceaccount.com" \
+    "serviceAccount:service-${dep_sa_num}@gcp-sa-dep.iam.gserviceaccount.com" \
+    "serviceAccount:service-${dep_sa_num}@gcp-sa-aiplatform-re.iam.gserviceaccount.com" \
+    "serviceAccount:service-${dep_sa_num}@gcp-sa-agentgateway.iam.gserviceaccount.com"; do
+    for ma_role in roles/modelarmor.calloutUser roles/modelarmor.user roles/serviceusage.serviceUsageConsumer; do
+      gcloud projects add-iam-policy-binding "${PROJECT_A_ID}" \
+        --member="${ma_sa}" \
+        --role="${ma_role}" --quiet >/dev/null 2>&1 || true
+      gcloud projects add-iam-policy-binding "${PROJECT_B_ID}" \
+        --member="${ma_sa}" \
+        --role="${ma_role}" --quiet >/dev/null 2>&1 || true
+    done
+  done
+done
+
+for ma_proj in "${PROJECT_A_ID}" "${PROJECT_B_ID}"; do
+  # Enable Model Armor Floor Settings FIRST so template update conforms with floorSetting
+  curl -s -X PATCH \
+    -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+    -H "Content-Type: application/json" \
+    -H "X-Goog-User-Project: ${ma_proj}" \
+    "https://modelarmor.googleapis.com/v1/projects/${ma_proj}/locations/global/floorSetting?updateMask=filterConfig,enableFloorSettingEnforcement,integratedServices,aiPlatformFloorSetting" \
+    -d '{
+      "filterConfig": {
+        "piAndJailbreakFilterSettings": {
+          "filterEnforcement": "ENABLED",
+          "confidenceLevel": "MEDIUM_AND_ABOVE"
+        },
+        "maliciousUriFilterSettings": {
+          "filterEnforcement": "ENABLED"
+        },
+        "raiSettings": {
+          "raiFilters": [
+            {"filterType": "HATE_SPEECH", "confidenceLevel": "HIGH"},
+            {"filterType": "HARASSMENT", "confidenceLevel": "HIGH"},
+            {"filterType": "SEXUALLY_EXPLICIT", "confidenceLevel": "HIGH"}
+          ]
+        }
+      },
+      "enableFloorSettingEnforcement": true,
+      "integratedServices": ["AI_PLATFORM"],
+      "aiPlatformFloorSetting": {
+        "inspectOnly": true,
+        "enableCloudLogging": true
+      }
+    }' >/dev/null 2>&1 || true
+
+  if CLOUDSDK_API_ENDPOINT_OVERRIDES_MODELARMOR="https://modelarmor.${REGION}.rep.googleapis.com/" \
+     gcloud model-armor templates describe secops-agent-guardrail \
+    --project="${ma_proj}" --location="${REGION}" >/dev/null 2>&1; then
+    CLOUDSDK_API_ENDPOINT_OVERRIDES_MODELARMOR="https://modelarmor.${REGION}.rep.googleapis.com/" \
+    gcloud -q model-armor templates update secops-agent-guardrail \
+      --project="${ma_proj}" \
+      --location="${REGION}" \
+      --pi-and-jailbreak-filter-settings-enforcement=enabled \
+      --pi-and-jailbreak-filter-settings-confidence-level=medium-and-above \
+      --malicious-uri-filter-settings-enforcement=enabled \
+      --rai-settings-filters='[{"filterType":"HATE_SPEECH","confidenceLevel":"HIGH"},{"filterType":"HARASSMENT","confidenceLevel":"HIGH"},{"filterType":"SEXUALLY_EXPLICIT","confidenceLevel":"HIGH"}]' \
+      --template-metadata-log-operations \
+      --template-metadata-log-sanitize-operations >/dev/null 2>&1 || true
+  else
+    CLOUDSDK_API_ENDPOINT_OVERRIDES_MODELARMOR="https://modelarmor.${REGION}.rep.googleapis.com/" \
+    gcloud -q model-armor templates create secops-agent-guardrail \
+      --project="${ma_proj}" \
+      --location="${REGION}" \
+      --pi-and-jailbreak-filter-settings-enforcement=enabled \
+      --pi-and-jailbreak-filter-settings-confidence-level=medium-and-above \
+      --malicious-uri-filter-settings-enforcement=enabled \
+      --rai-settings-filters='[{"filterType":"HATE_SPEECH","confidenceLevel":"HIGH"},{"filterType":"HARASSMENT","confidenceLevel":"HIGH"},{"filterType":"SEXUALLY_EXPLICIT","confidenceLevel":"HIGH"}]' \
+      --template-metadata-log-operations \
+      --template-metadata-log-sanitize-operations || true
+  fi
+done
+
+cat > /tmp/agw-cfg/ma-authz-ext.yaml <<EOF
+name: enterprise-egress-agw-ma-ext
+service: modelarmor.${REGION}.rep.googleapis.com
+failOpen: false
+timeout: 1s
+metadata:
+  model_armor_settings: '[{"request_template_id":"projects/${PROJECT_A_ID}/locations/${REGION}/templates/secops-agent-guardrail","response_template_id":"projects/${PROJECT_A_ID}/locations/${REGION}/templates/secops-agent-guardrail"}]'
+EOF
+
+echo "Importing Model Armor Authz Extension 'enterprise-egress-agw-ma-ext'..."
+gcloud -q service-extensions authz-extensions import enterprise-egress-agw-ma-ext \
+  --project="${PROJECT_A_ID}" \
+  --location="${REGION}" \
+  --source="/tmp/agw-cfg/ma-authz-ext.yaml" || true
+
+cat > /tmp/agw-cfg/ma-authz-policy.yaml <<EOF
+name: enterprise-egress-agw-ma-policy
+target:
+  resources:
+    - "projects/${PROJECT_A_ID}/locations/${REGION}/agentGateways/enterprise-egress-agw"
+policyProfile: CONTENT_AUTHZ
+action: CUSTOM
+httpRules:
+  - to:
+      operations:
+        - hosts:
+            - suffix: ".run.app"
+            - suffix: ".azurewebsites.net"
+customProvider:
+  authzExtension:
+    resources:
+      - "projects/${PROJECT_A_ID}/locations/${REGION}/authzExtensions/enterprise-egress-agw-ma-ext"
+EOF
+
+echo "Importing Model Armor Content Authz Policy 'enterprise-egress-agw-ma-policy'..."
+gcloud -q network-security authz-policies import enterprise-egress-agw-ma-policy \
+  --project="${PROJECT_A_ID}" \
+  --location="${REGION}" \
+  --source="/tmp/agw-cfg/ma-authz-policy.yaml" || true
+
+cat > /tmp/agw-cfg/agw-telemetry-policy.yaml <<EOF
+name: enterprise-egress-agw-telemetry
+telemetryTarget:
+  resources:
+    - "//networkservices.googleapis.com/projects/${PROJECT_A_ID}/locations/${REGION}/agentGateways/enterprise-egress-agw"
+tracingConfiguration:
+  samplingRate: 1.0
+  parentBasedSampling:
+    enabled: true
+EOF
+
+echo "Checking Agent Gateway Distributed Trace TelemetryPolicy 'enterprise-egress-agw-telemetry'..."
+gcloud beta network-services telemetry-policies import enterprise-egress-agw-telemetry \
+  --source="/tmp/agw-cfg/agw-telemetry-policy.yaml" \
+  --location="${REGION}" \
+  --project="${PROJECT_A_ID}" \
+  --quiet || true
+
+# ==============================================================================
 # 6. REGISTER MCP SERVERS & CORE GOOGLE APIS IN PROJECT A'S AGENT REGISTRY
 # ==============================================================================
 echo "Checking Core Google APIs, Internal Cloud Run MCP & External GitHub Copilot MCP in Project A Registry..."
 
 GAPI_INTERFACES=(
   "--interfaces=protocolBinding=JSONRPC,url=https://telemetry.googleapis.com"
+  "--interfaces=protocolBinding=JSONRPC,url=https://telemetry.googleapis.com:443"
   "--interfaces=protocolBinding=JSONRPC,url=https://telemetry.mtls.googleapis.com"
+  "--interfaces=protocolBinding=JSONRPC,url=https://telemetry.mtls.googleapis.com:443"
+  "--interfaces=protocolBinding=JSONRPC,url=https://cloudtrace.googleapis.com"
+  "--interfaces=protocolBinding=JSONRPC,url=https://cloudtrace.mtls.googleapis.com"
   "--interfaces=protocolBinding=JSONRPC,url=https://${REGION}-aiplatform.googleapis.com"
   "--interfaces=protocolBinding=JSONRPC,url=https://${REGION}-aiplatform.googleapis.com:443"
   "--interfaces=protocolBinding=JSONRPC,url=https://${REGION}-aiplatform.mtls.googleapis.com"
@@ -489,6 +716,8 @@ GAPI_INTERFACES=(
   "--interfaces=protocolBinding=JSONRPC,url=https://logging.mtls.googleapis.com"
   "--interfaces=protocolBinding=JSONRPC,url=https://monitoring.googleapis.com"
   "--interfaces=protocolBinding=JSONRPC,url=https://monitoring.mtls.googleapis.com"
+  "--interfaces=protocolBinding=JSONRPC,url=https://modelarmor.${REGION}.rep.googleapis.com"
+  "--interfaces=protocolBinding=JSONRPC,url=https://modelarmor.${REGION}.rep.googleapis.com:443"
   "--interfaces=protocolBinding=JSONRPC,url=${CALLBACK_SERVICE_URL}"
   "--interfaces=protocolBinding=JSONRPC,url=${CALLBACK_SERVICE_URL}/registerNonce"
 )
@@ -604,6 +833,21 @@ cat > /tmp/agw-cfg/github-toolspec.json <<EOF
       }
     },
     {
+      "name": "issue_write",
+      "description": "Create a new or update an existing issue in a GitHub repository.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "method": {"type": "string"},
+          "owner": {"type": "string"},
+          "repo": {"type": "string"},
+          "title": {"type": "string"},
+          "body": {"type": "string"}
+        },
+        "required": ["method", "owner", "repo", "title"]
+      }
+    },
+    {
       "name": "create_issue",
       "description": "Create a new GitHub issue in a repository.",
       "inputSchema": {
@@ -616,12 +860,35 @@ cat > /tmp/agw-cfg/github-toolspec.json <<EOF
         },
         "required": ["owner", "repo", "title"]
       }
+    },
+    {
+      "name": "create_github_remediation_issue",
+      "description": "Create a GitHub remediation issue via 3LO OAuth attributing the ticket to the authenticated human engineer.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "owner": {"type": "string"},
+          "repo": {"type": "string"},
+          "title": {"type": "string"},
+          "body": {"type": "string"}
+        },
+        "required": ["owner", "repo", "title", "body"]
+      }
     }
   ]
 }
 EOF
 
-gcloud alpha agent-registry services describe github-copilot-mcp --project="${PROJECT_A_ID}" --location="${REGION}" >/dev/null 2>&1 || \
+if gcloud alpha agent-registry services describe github-copilot-mcp --project="${PROJECT_A_ID}" --location="${REGION}" >/dev/null 2>&1; then
+  gcloud -q alpha agent-registry services update github-copilot-mcp \
+    --project="${PROJECT_A_ID}" \
+    --location="${REGION}" \
+    --display-name="External GitHub Copilot MCP Server" \
+    --description="External GitHub Copilot MCP governed via 3LO" \
+    --mcp-server-spec-type=tool-spec \
+    --mcp-server-spec-content=/tmp/agw-cfg/github-toolspec.json \
+    --interfaces="url=https://api.githubcopilot.com/mcp/,protocolBinding=JSONRPC" >/dev/null
+else
   gcloud -q alpha agent-registry services create github-copilot-mcp \
     --project="${PROJECT_A_ID}" \
     --location="${REGION}" \
@@ -630,6 +897,58 @@ gcloud alpha agent-registry services describe github-copilot-mcp --project="${PR
     --mcp-server-spec-type=tool-spec \
     --mcp-server-spec-content=/tmp/agw-cfg/github-toolspec.json \
     --interfaces="url=https://api.githubcopilot.com/mcp/,protocolBinding=JSONRPC"
+fi
+
+cat > /tmp/agw-cfg/azure-weather-toolspec.json <<EOF
+{
+  "tools": [
+    {
+      "name": "GetWeather",
+      "description": "Retrieve current weather for a location/city from the Cross-Cloud Azure MCP Server.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "location": {"type": "string", "description": "Location or city name (e.g. Zurich, Seattle, London)."},
+          "city": {"type": "string", "description": "City name (e.g. Zurich, Seattle, London)."},
+          "country": {"type": "string", "description": "Optional country code or name."}
+        }
+      }
+    },
+    {
+      "name": "get_weather",
+      "description": "Retrieve current weather for a location/city from the Cross-Cloud Azure MCP Server.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "location": {"type": "string", "description": "Location or city name (e.g. Zurich, Seattle, London)."},
+          "city": {"type": "string", "description": "City name (e.g. Zurich, Seattle, London)."},
+          "country": {"type": "string", "description": "Optional country code or name."}
+        }
+      }
+    }
+  ]
+}
+EOF
+
+if gcloud alpha agent-registry services describe azure-weather-mcp --project="${PROJECT_A_ID}" --location="${REGION}" >/dev/null 2>&1; then
+  gcloud -q alpha agent-registry services update azure-weather-mcp \
+    --project="${PROJECT_A_ID}" \
+    --location="${REGION}" \
+    --display-name="Cross-Cloud Azure Weather MCP Server" \
+    --description="Cross-Cloud Azure Functions MCP Server (GetWeather) with W3C OTLP Trace Propagation" \
+    --mcp-server-spec-type=tool-spec \
+    --mcp-server-spec-content=/tmp/agw-cfg/azure-weather-toolspec.json \
+    --interfaces="url=${AZURE_MCP_URL},protocolBinding=JSONRPC" >/dev/null
+else
+  gcloud -q alpha agent-registry services create azure-weather-mcp \
+    --project="${PROJECT_A_ID}" \
+    --location="${REGION}" \
+    --display-name="Cross-Cloud Azure Weather MCP Server" \
+    --description="Cross-Cloud Azure Functions MCP Server (GetWeather) with W3C OTLP Trace Propagation" \
+    --mcp-server-spec-type=tool-spec \
+    --mcp-server-spec-content=/tmp/agw-cfg/azure-weather-toolspec.json \
+    --interfaces="url=${AZURE_MCP_URL},protocolBinding=JSONRPC"
+fi
 
 # ==============================================================================
 # 7. STAGING BUCKETS & SPIFFE PRINCIPALSET RUNTIME PERMISSIONS
@@ -646,14 +965,45 @@ PRINCIPAL_SET_A="principalSet://agents.global.org-${ORG_ID}.system.id.goog/attri
 PRINCIPAL_SET_B="principalSet://agents.global.org-${ORG_ID}.system.id.goog/attribute.platformContainer/aiplatform/projects/${PROJECT_B_NUM}"
 
 if ! gcloud alpha agent-registry bindings describe github-mcp-3lo-binding --project="${PROJECT_A_ID}" --location="${REGION}" >/dev/null 2>&1; then
-  for role in roles/aiplatform.user roles/agentregistry.viewer roles/logging.logWriter roles/monitoring.metricWriter roles/browser; do
+  for role in roles/aiplatform.user roles/agentregistry.viewer roles/logging.logWriter roles/monitoring.metricWriter roles/cloudtrace.agent roles/telemetry.tracesWriter roles/browser; do
     gcloud -q projects add-iam-policy-binding "${PROJECT_A_ID}" \
       --member="${PRINCIPAL_SET_A}" \
-      --role="${role}" >/dev/null
+      --role="${role}" >/dev/null 2>&1 || true
     gcloud -q projects add-iam-policy-binding "${PROJECT_B_ID}" \
       --member="${PRINCIPAL_SET_B}" \
-      --role="${role}" >/dev/null
+      --role="${role}" >/dev/null 2>&1 || true
   done
+fi
+
+for trace_role in roles/cloudtrace.agent roles/telemetry.tracesWriter roles/logging.logWriter; do
+  gcloud -q projects add-iam-policy-binding "${PROJECT_A_ID}" \
+    --member="${PRINCIPAL_SET_A}" \
+    --role="${trace_role}" >/dev/null 2>&1 || true
+  gcloud -q projects add-iam-policy-binding "${PROJECT_B_ID}" \
+    --member="${PRINCIPAL_SET_B}" \
+    --role="${trace_role}" >/dev/null 2>&1 || true
+  # Cross-project OTLP & Log correlation: allow Project B agents & Cloud Run MCP server to write spans/logs to Project A
+  gcloud -q projects add-iam-policy-binding "${PROJECT_A_ID}" \
+    --member="${PRINCIPAL_SET_B}" \
+    --role="${trace_role}" >/dev/null 2>&1 || true
+  gcloud -q projects add-iam-policy-binding "${PROJECT_A_ID}" \
+    --member="serviceAccount:${PROJECT_B_NUM}-compute@developer.gserviceaccount.com" \
+    --role="${trace_role}" >/dev/null 2>&1 || true
+done
+
+echo "Configuring Cross-Project Log Sink ('project-b-to-project-a-agw-logs') from Project B into Project A's _Default Log Analytics bucket..."
+gcloud logging sinks describe project-b-to-project-a-agw-logs --project="${PROJECT_B_ID}" >/dev/null 2>&1 || \
+gcloud -q logging sinks create project-b-to-project-a-agw-logs \
+  "logging.googleapis.com/projects/${PROJECT_A_ID}/locations/global/buckets/_Default" \
+  --project="${PROJECT_B_ID}" \
+  --log-filter='resource.type="aiplatform.googleapis.com/ReasoningEngine" OR (resource.type="cloud_run_revision" AND resource.labels.service_name="internal-mcp-server")' >/dev/null 2>&1 || true
+
+SINK_WRITER_IDENTITY=$(gcloud logging sinks describe project-b-to-project-a-agw-logs \
+  --project="${PROJECT_B_ID}" --format="value(writerIdentity)" 2>/dev/null || true)
+if [[ -n "${SINK_WRITER_IDENTITY}" ]]; then
+  gcloud -q projects add-iam-policy-binding "${PROJECT_A_ID}" \
+    --member="${SINK_WRITER_IDENTITY}" \
+    --role="roles/logging.bucketWriter" >/dev/null 2>&1 || true
 fi
 
 for cross_role in roles/aiplatform.user roles/agentregistry.viewer; do
@@ -742,7 +1092,7 @@ if [[ -n "${AGENT_1_SPIFFE:-}" && -n "${AGENT_2_SPIFFE:-}" ]]; then
       --auth-provider-binding-scopes="repo"
   fi
 
-  # 8b-2. Register per-agent runtime mTLS endpoints in Project A's Agent Registry (per agent-gateway-runtime-deploy.md:L392-L452)
+  # 8b-2. Register per-agent runtime mTLS endpoints in Project A's Agent Registry
   AGENT_2_SHORT_ID="${RE_2_ID:-${AGENT_2_SPIFFE##*/}}"
   echo "  -> [8b-2] Registering Agent 1 (${AGENT_1_SHORT_ID}) and Agent 2 (${AGENT_2_SHORT_ID}) runtime mTLS endpoints in Project A's Agent Registry..."
   gcloud alpha agent-registry services describe runtime-agent-1 \
@@ -790,6 +1140,11 @@ if [[ -n "${AGENT_1_SPIFFE:-}" && -n "${AGENT_2_SPIFFE:-}" ]]; then
   GITHUB_MCP_UID=$(gcloud alpha agent-registry mcp-servers list \
     --project="${PROJECT_A_ID}" --location="${REGION}" \
     --filter="displayName='External GitHub Copilot MCP Server'" \
+    --format="value(name)" | awk -F'/' '{print $NF}')
+
+  AZURE_MCP_UID=$(gcloud alpha agent-registry mcp-servers list \
+    --project="${PROJECT_A_ID}" --location="${REGION}" \
+    --filter="displayName='Cross-Cloud Azure Weather MCP Server'" \
     --format="value(name)" | awk -F'/' '{print $NF}')
 
   cat > /tmp/agw-cfg/iap-both-agents.json <<EOF
@@ -840,8 +1195,38 @@ EOF
     fi
   done
 
+  cat > /tmp/agw-cfg/iap-internal-mcp-cel.json <<EOF
+{
+  "bindings": [
+    {
+      "role": "roles/iap.egressor",
+      "members": [
+        "${AGENT_1_SPIFFE}",
+        "${PRINCIPAL_SET_A}",
+        "serviceAccount:service-${PROJECT_A_NUM}@gcp-sa-aiplatform-re.iam.gserviceaccount.com",
+        "serviceAccount:service-${PROJECT_A_NUM}@gcp-sa-aiplatform.iam.gserviceaccount.com"
+      ]
+    },
+    {
+      "role": "roles/iap.egressor",
+      "members": [
+        "${AGENT_2_SPIFFE}",
+        "${PRINCIPAL_SET_B}",
+        "serviceAccount:service-${PROJECT_B_NUM}@gcp-sa-aiplatform-re.iam.gserviceaccount.com",
+        "serviceAccount:service-${PROJECT_B_NUM}@gcp-sa-aiplatform.iam.gserviceaccount.com"
+      ],
+      "condition": {
+        "title": "allow_agent2_readonly_secops_tools",
+        "description": "Allow Agent 2 (Project B Auditor) only read-only CVE & manifest tools on internal-cloudrun-mcp; deny mutating record_remediation_ticket",
+        "expression": "api.getAttribute('iap.googleapis.com/mcp.toolName', '') == '' || api.getAttribute('iap.googleapis.com/mcp.toolName', '') == 'get_active_cve_alerts' || api.getAttribute('iap.googleapis.com/mcp.toolName', '') == 'get_internal_deployment_manifest'"
+      }
+    }
+  ]
+}
+EOF
+
   if [[ -n "${INTERNAL_MCP_UID}" ]]; then
-    gcloud -q alpha iap web set-iam-policy /tmp/agw-cfg/iap-both-agents.json \
+    gcloud -q alpha iap web set-iam-policy /tmp/agw-cfg/iap-internal-mcp-cel.json \
       --project="${PROJECT_A_ID}" \
       --region="${REGION}" \
       --resource-type=agent-registry \
@@ -854,6 +1239,14 @@ EOF
       --region="${REGION}" \
       --resource-type=agent-registry \
       --mcp-server="${GITHUB_MCP_UID}" >/dev/null
+  fi
+
+  if [[ -n "${AZURE_MCP_UID}" ]]; then
+    gcloud -q alpha iap web set-iam-policy /tmp/agw-cfg/iap-agent1-only.json \
+      --project="${PROJECT_A_ID}" \
+      --region="${REGION}" \
+      --resource-type=agent-registry \
+      --mcp-server="${AZURE_MCP_UID}" >/dev/null
   fi
 
   # 8d. Switch IAP Authz Extension to enforced V1 mode (matches per-resource Agent Registry IAP bindings)

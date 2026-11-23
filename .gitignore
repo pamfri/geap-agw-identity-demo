@@ -1,32 +1,43 @@
-# Python bytecode & virtual environments
+# Local environment variables & OAuth secrets
+.env
+.env.*
+!.env.example
+*.env
+!terraform/terraform.tfvars.example
+
+# Generated SPIFFE workload identities & runtime outputs
+agents/spiffe_identities.env
+spiffe_identities.env
+
+# GCP Service Account keys & credentials (NEVER commit)
+*key*.json
+*credentials*.json
+azure-mcp-trace-writer-key.json
+*.pem
+*.p12
+
+# Python bytecode, virtualenvs & caches
 __pycache__/
 *.py[cod]
 *$py.class
 .venv/
 venv/
-ENV/
+.pytest_cache/
 
-# Generated runtime SPIFFE identities & local environment secrets
-.env
-*.env
-!*.env.example
-agents/spiffe_identities.env
+# Terraform state, caches & local variable files
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/terraform.tfvars
+terraform/.terraform.lock.hcl
 
-# Terraform state & sensitive variable files
-.terraform/
-*.tfstate
-*.tfstate.*
-crash.log
-*.tfvars
-!*.tfvars.example
-override.tf
-override.tf.json
-*_override.tf
-*_override.tf.json
-.terraformrc
-terraform.rc
-
-# macOS / IDE files
+# Archives & OS metadata
+*.tar.gz
+*.tgz
+*.zip
 .DS_Store
-.idea/
 .vscode/
+.idea/
+
+# Out-of-scope / excluded scripts
+scripts/extend_alt4_control_plane_observability.sh

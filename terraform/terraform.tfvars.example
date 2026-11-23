@@ -6,4 +6,6 @@ project_b_id               = "your-project-b-id"
 region                     = "us-central1"
 github_oauth_client_id     = "PASTE_YOUR_GITHUB_CLIENT_ID"
 github_oauth_client_secret = "PASTE_YOUR_GITHUB_CLIENT_SECRET"
-oauth_default_continue_uri = "http://localhost:8501/validateUserId"
+mcp_container_image        = "us-central1-docker.pkg.dev/your-project-b-id/mcp-repo/internal-mcp-server:latest"
+# Optional override; defaults to https://secops-3lo-callback-<PROJECT_A_NUM>.<REGION>.run.app/validateUserId
+# oauth_default_continue_uri = "https://secops-3lo-callback-123456789012.us-central1.run.app/validateUserId"
