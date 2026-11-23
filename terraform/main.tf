@@ -45,18 +45,36 @@ locals {
     "agentregistry.googleapis.com",
     "agentidentity.googleapis.com",
     "agentidentitycredentials.googleapis.com",
+    "apphub.googleapis.com",
+    "apptopology.googleapis.com",
+    "cloudasset.googleapis.com",
     "iap.googleapis.com",
+    "modelarmor.googleapis.com",
+    "networksecurity.googleapis.com",
     "networkservices.googleapis.com",
+    "observability.googleapis.com",
+    "securitycenter.googleapis.com",
+    "serviceextensions.googleapis.com",
     "accesscontextmanager.googleapis.com",
     "cloudresourcemanager.googleapis.com",
     "serviceusage.googleapis.com",
     "logging.googleapis.com",
     "monitoring.googleapis.com",
-    "cloudtrace.googleapis.com"
+    "cloudtrace.googleapis.com",
+    "telemetry.googleapis.com",
+    "run.googleapis.com",
+    "semanticgovernancepolicy.googleapis.com",
+    "discoveryengine.googleapis.com"
   ]
 
   project_b_apis = [
     "aiplatform.googleapis.com",
+    "agentregistry.googleapis.com",
+    "apphub.googleapis.com",
+    "apptopology.googleapis.com",
+    "cloudasset.googleapis.com",
+    "observability.googleapis.com",
+    "securitycenter.googleapis.com",
     "run.googleapis.com",
     "compute.googleapis.com",
     "dns.googleapis.com",
@@ -65,7 +83,11 @@ locals {
     "cloudbuild.googleapis.com",
     "logging.googleapis.com",
     "monitoring.googleapis.com",
-    "cloudtrace.googleapis.com"
+    "cloudtrace.googleapis.com",
+    "telemetry.googleapis.com",
+    "run.googleapis.com",
+    "semanticgovernancepolicy.googleapis.com",
+    "discoveryengine.googleapis.com"
   ]
 }
 
@@ -156,6 +178,25 @@ resource "google_dns_record_set" "googleapis_wildcard_cname" {
   rrdatas      = ["restricted.googleapis.com."]
 }
 
+resource "google_compute_global_address" "psc2gapis" {
+  project      = google_project.project_b.project_id
+  name         = "ip-psc2gapis"
+  purpose      = "PRIVATE_SERVICE_CONNECT"
+  address_type = "INTERNAL"
+  address      = "240.0.0.10"
+  network      = google_compute_network.vpc_agw_egress.id
+  depends_on   = [google_project_service.project_b_services]
+}
+
+resource "google_compute_global_forwarding_rule" "psc2gapis" {
+  project               = google_project.project_b.project_id
+  name                  = "psc2gapis"
+  target                = "all-apis"
+  network               = google_compute_network.vpc_agw_egress.id
+  ip_address            = google_compute_global_address.psc2gapis.id
+  load_balancing_scheme = ""
+}
+
 resource "google_dns_managed_zone" "run_app_restricted" {
   project    = google_project.project_b.project_id
   name       = "run-app-restricted"
@@ -170,22 +211,13 @@ resource "google_dns_managed_zone" "run_app_restricted" {
   depends_on = [google_project_service.project_b_services]
 }
 
-resource "google_dns_record_set" "run_app_a" {
-  project      = google_project.project_b.project_id
-  managed_zone = google_dns_managed_zone.run_app_restricted.name
-  name         = "run.app."
-  type         = "A"
-  ttl          = 300
-  rrdatas      = ["199.36.153.4", "199.36.153.5", "199.36.153.6", "199.36.153.7"]
-}
-
-resource "google_dns_record_set" "run_app_wildcard_cname" {
+resource "google_dns_record_set" "run_app_wildcard_a" {
   project      = google_project.project_b.project_id
   managed_zone = google_dns_managed_zone.run_app_restricted.name
   name         = "*.run.app."
-  type         = "CNAME"
+  type         = "A"
   ttl          = 300
-  rrdatas      = ["run.app."]
+  rrdatas      = [google_compute_global_address.psc2gapis.address]
 }
 
 resource "google_compute_network_attachment" "agw_net_attachment" {
@@ -210,6 +242,10 @@ resource "google_cloud_run_v2_service" "internal_mcp_server" {
   name     = "internal-mcp-server"
   location = var.region
   ingress  = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+
+  annotations = {
+    "apphub.cloud.google.com/functional-type" = "mcp-server"
+  }
 
   template {
     containers {
@@ -275,7 +311,7 @@ resource "terraform_data" "agw_3lo_and_spiffe_setup" {
       MCP_URL                    = google_cloud_run_v2_service.internal_mcp_server.uri
       GITHUB_OAUTH_CLIENT_ID     = var.github_oauth_client_id
       GITHUB_OAUTH_CLIENT_SECRET = var.github_oauth_client_secret
-      OAUTH_CONTINUE_URI         = var.oauth_default_continue_uri
+      OAUTH_CONTINUE_URI         = var.oauth_default_continue_uri != "" ? var.oauth_default_continue_uri : "https://secops-3lo-callback-${google_project.project_a.number}.${var.region}.run.app/validateUserId"
     }
     command = <<-EOT
       set -euo pipefail
@@ -300,7 +336,7 @@ resource "terraform_data" "agw_3lo_and_spiffe_setup" {
         --display-name="GitHub Copilot MCP 3LO Auth Provider" \
         --three-legged-oauth-client-id="$GITHUB_OAUTH_CLIENT_ID" \
         --three-legged-oauth-client-secret="$GITHUB_OAUTH_CLIENT_SECRET" \
-        --three-legged-oauth-authorization-url="https://github.com/login/oauth/authorize?scope=repo%20read:org%20read:user" \
+        --three-legged-oauth-authorization-url="https://github.com/login/oauth/authorize" \
         --three-legged-oauth-token-url="https://github.com/login/oauth/access_token" \
         --three-legged-oauth-default-continue-uri="$OAUTH_CONTINUE_URI"
 
@@ -339,6 +375,97 @@ resource "terraform_data" "agw_3lo_and_spiffe_setup" {
         --region="$REGION" \
         --member="serviceAccount:$${AGW_SA}" \
         --role="roles/run.invoker"
+
+      # 5. Enable Log Analytics on _Default buckets for Gateway Observability & Anomaly Detection
+      gcloud logging buckets update _Default --location=global --enable-analytics --async --project="$PROJECT_A_ID" || true
+      gcloud logging buckets update _Default --location=global --enable-analytics --async --project="$PROJECT_B_ID" || true
+
+      # 6. Configure Model Armor Inline Guardrail ('secops-agent-guardrail'), Floor Settings + CONTENT_AUTHZ on Agent Gateway
+      gcloud beta services identity create --service=modelarmor.googleapis.com --project="$PROJECT_A_ID" || true
+      gcloud beta services identity create --service=modelarmor.googleapis.com --project="$PROJECT_B_ID" || true
+      for dep_num in "$PROJECT_A_NUM" "$PROJECT_B_NUM"; do
+        for ma_sa in \
+          "serviceAccount:service-$${dep_num}@gcp-sa-dep.iam.gserviceaccount.com" \
+          "serviceAccount:service-$${dep_num}@gcp-sa-aiplatform-re.iam.gserviceaccount.com" \
+          "serviceAccount:service-$${dep_num}@gcp-sa-agentgateway.iam.gserviceaccount.com"; do
+          for ma_role in roles/modelarmor.calloutUser roles/modelarmor.user roles/serviceusage.serviceUsageConsumer; do
+            gcloud projects add-iam-policy-binding "$PROJECT_A_ID" \
+              --member="$${ma_sa}" --role="$${ma_role}" --quiet || true
+            gcloud projects add-iam-policy-binding "$PROJECT_B_ID" \
+              --member="$${ma_sa}" --role="$${ma_role}" --quiet || true
+          done
+        done
+      done
+
+      gcloud model-armor templates create secops-agent-guardrail \
+        --project="$PROJECT_A_ID" \
+        --location="$REGION" \
+        --pi-and-jailbreak-filter-settings-enforcement=enabled \
+        --pi-and-jailbreak-filter-settings-confidence-level=low-and-above \
+        --malicious-uri-filter-settings-enforcement=enabled \
+        --rai-settings-filters='[{"filterType":"HATE_SPEECH","confidenceLevel":"MEDIUM_AND_ABOVE"},{"filterType":"DANGEROUS","confidenceLevel":"LOW_AND_ABOVE"},{"filterType":"HARASSMENT","confidenceLevel":"MEDIUM_AND_ABOVE"},{"filterType":"SEXUALLY_EXPLICIT","confidenceLevel":"MEDIUM_AND_ABOVE"}]' \
+        --template-metadata-log-operations \
+        --template-metadata-log-sanitize-operations || true
+
+      mkdir -p /tmp/agw-tf-cfg
+      cat > /tmp/agw-tf-cfg/ma-authz-ext.yaml <<EOF
+name: enterprise-egress-agw-ma-ext
+service: modelarmor.$${REGION}.rep.googleapis.com
+failOpen: false
+timeout: 1s
+metadata:
+  model_armor_settings: '[{"request_template_id":"projects/$${PROJECT_A_ID}/locations/$${REGION}/templates/secops-agent-guardrail","response_template_id":"projects/$${PROJECT_A_ID}/locations/$${REGION}/templates/secops-agent-guardrail"}]'
+EOF
+      gcloud service-extensions authz-extensions import enterprise-egress-agw-ma-ext \
+        --project="$PROJECT_A_ID" --location="$REGION" --source=/tmp/agw-tf-cfg/ma-authz-ext.yaml --quiet
+
+      cat > /tmp/agw-tf-cfg/ma-authz-policy.yaml <<EOF
+name: enterprise-egress-agw-ma-policy
+target:
+  resources:
+    - "projects/$${PROJECT_A_ID}/locations/$${REGION}/agentGateways/enterprise-egress-agw"
+policyProfile: CONTENT_AUTHZ
+action: CUSTOM
+httpRules:
+  - to:
+      operations:
+        - hosts:
+            - suffix: ".run.app"
+            - suffix: ".azurewebsites.net"
+customProvider:
+  authzExtension:
+    resources:
+      - "projects/$${PROJECT_A_ID}/locations/$${REGION}/authzExtensions/enterprise-egress-agw-ma-ext"
+EOF
+      gcloud network-security authz-policies import enterprise-egress-agw-ma-policy \
+        --project="$PROJECT_A_ID" --location="$REGION" --source=/tmp/agw-tf-cfg/ma-authz-policy.yaml --quiet
+
+      # 7. Stitch Agent Gateway Spans into Cloud Trace via TelemetryPolicy
+      cat > /tmp/agw-tf-cfg/agw-telemetry-policy.yaml <<EOF
+name: enterprise-egress-agw-telemetry
+telemetryTarget:
+  resources:
+    - "//networkservices.googleapis.com/projects/$${PROJECT_A_ID}/locations/$${REGION}/agentGateways/enterprise-egress-agw"
+tracingConfiguration:
+  samplingRate: 1.0
+  parentBasedSampling:
+    enabled: true
+EOF
+      gcloud beta network-services telemetry-policies import enterprise-egress-agw-telemetry \
+        --project="$PROJECT_A_ID" --location="$REGION" --source=/tmp/agw-tf-cfg/agw-telemetry-policy.yaml --quiet || true
+
+      # 8. Cross-Project & Cross-Cloud OTLP Trace + Log Analytics Correlation into Project A
+      gcloud logging sinks create project-b-to-project-a-agw-logs \
+        "logging.googleapis.com/projects/$${PROJECT_A_ID}/locations/global/buckets/_Default" \
+        --project="$PROJECT_B_ID" \
+        --log-filter='resource.type="aiplatform.googleapis.com/ReasoningEngine" OR (resource.type="cloud_run_revision" AND resource.labels.service_name="internal-mcp-server")' --quiet || true
+
+      SINK_WRITER=$(gcloud logging sinks describe project-b-to-project-a-agw-logs --project="$PROJECT_B_ID" --format="value(writerIdentity)" || true)
+      if [[ -n "$SINK_WRITER" ]]; then
+        gcloud projects add-iam-policy-binding "$PROJECT_A_ID" \
+          --member="$SINK_WRITER" \
+          --role="roles/logging.bucketWriter" --quiet || true
+      fi
     EOT
   }
 }

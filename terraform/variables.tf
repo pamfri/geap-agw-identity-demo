@@ -44,13 +44,13 @@ variable "github_oauth_client_secret" {
 }
 
 variable "oauth_default_continue_uri" {
-  description = "Default Continue URI for 3LO user ID validation after GitHub OAuth callback"
+  description = "Optional override for 3LO user ID validation continue URI (defaults to Cloud Run secops-3lo-callback in Project A)"
   type        = string
-  default     = "http://localhost:8501/validateUserId"
+  default     = ""
 }
 
 variable "mcp_container_image" {
   description = "Container image for the private SecOps Cloud Run MCP Server in Project B"
   type        = string
-  default     = "us-central1-docker.pkg.dev/proj-agent-mcp-spoke/mcp-repo/internal-mcp-server:latest"
+  default     = "us-central1-docker.pkg.dev/your-project-b-id/mcp-repo/internal-mcp-server:latest"
 }

@@ -13,16 +13,15 @@ Auth Manager (`agentidentitycredentials.googleapis.com`) and Agent 1
    OAuth token in Google Cloud Auth Manager's vault.
 """
 
+import html
 import os
 from typing import Any
 from urllib.parse import urlencode
-from fastapi import FastAPI, Query, Request as FastAPIRequest
+from fastapi import FastAPI, HTTPException, Query, Request as FastAPIRequest
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 import google.auth
 from google.auth.transport.requests import Request
 import requests
-import vertexai
-from vertexai import agent_engines
 
 PROJECT_A_ID = os.environ.get("PROJECT_A_ID", "your-project-a-id")
 PROJECT_A_NUM = os.environ.get("PROJECT_A_NUM", "YOUR_PROJECT_A_NUM")
@@ -31,6 +30,12 @@ RE_1_ID = os.environ.get("RE_1_ID", "YOUR_REASONING_ENGINE_1_ID")
 DEFAULT_USER_ID = os.environ.get("USER_ID", "secops-engineer-01")
 PLAYGROUND_USER_ID = "vais-query-reasoning-engine"
 GITHUB_OAUTH_SCOPES = ["repo"]
+ALLOWED_AUTH_PROVIDER = (
+    f"projects/{PROJECT_A_ID}/locations/{REGION}/authProviders/github-mcp-auth"
+)
+ENABLE_DEMO_CHAT_UI = (
+    os.environ.get("ENABLE_DEMO_CHAT_UI", "false").lower() == "true"
+)
 
 app = FastAPI(title="SecOps Incident-to-PR 3LO Cloud Run Callback Service")
 
@@ -144,22 +149,33 @@ def index() -> str:
 
 @app.post("/chat")
 def chat(payload: dict[str, str]) -> JSONResponse:
+  if not ENABLE_DEMO_CHAT_UI:
+    raise HTTPException(
+        status_code=403,
+        detail="Public /chat endpoint is disabled; use the IAM-protected GCP Console Agent Engine Playground.",
+    )
   prompt = payload.get("prompt", "")
   user_id = payload.get("user_id", DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
   _PENDING_CONSENT["active_user_id"] = user_id
 
-  vertexai.init(project=PROJECT_A_ID, location=REGION)
-  remote_agent = agent_engines.get(
-      f"projects/{PROJECT_A_NUM}/locations/{REGION}/reasoningEngines/{RE_1_ID}"
+  stream_url = (
+      f"https://{REGION}-aiplatform.googleapis.com/v1/"
+      f"projects/{PROJECT_A_NUM}/locations/{REGION}/reasoningEngines/{RE_1_ID}:streamQuery"
   )
-
-  events = []
+  resp = requests.post(
+      stream_url,
+      headers=_get_gcp_headers(),
+      json={"input": {"user_id": user_id, "message": prompt}},
+      timeout=60,
+  )
+  resp.raise_for_status()
+  events = [
+      __import__("json").loads(line)
+      for line in resp.text.splitlines()
+      if line.strip()
+  ]
   auth_uri = None
-  for event in remote_agent.stream_query(
-      user_id=user_id,
-      message=prompt,
-  ):
-    events.append(event)
+  for event in events:
     content = event.get("content", {}) if isinstance(event, dict) else {}
     for part in content.get("parts", []):
       fn_call = part.get("function_call") or {}
@@ -248,11 +264,12 @@ def authorize(
   data = resp.json()
 
   if "success" in data:
+    safe_uid = html.escape(user_id)
     return HTMLResponse(f"""
       <html>
         <body style="font-family: system-ui, sans-serif; max-width: 650px; margin: 3rem auto;">
           <h2>GitHub 3LO Token Already Active!</h2>
-          <p>User <code>{user_id}</code> already has an active vaulted GitHub OAuth token in Google Cloud Auth Manager.</p>
+          <p>User <code>{safe_uid}</code> already has an active vaulted GitHub OAuth token in Google Cloud Auth Manager.</p>
           <p>Return to the <strong>Cloud Console GEAP Playground</strong> and ask Agent 1 to call <code>get_github_authenticated_user</code>.</p>
         </body>
       </html>
@@ -294,6 +311,11 @@ def validate_user_id(
     nonce: str | None = Query(None),
 ) -> str:
   """Called by Google Cloud Auth Manager after GitHub redirects to /oauthcallback."""
+  if auth_provider_name != ALLOWED_AUTH_PROVIDER:
+    raise HTTPException(
+        status_code=400,
+        detail="Invalid auth_provider_name parameter.",
+    )
   user_id = (
       uid
       or _PENDING_CONSENT.get("active_user_id")
@@ -308,12 +330,12 @@ def validate_user_id(
       nonce
       or cookie_nonce
       or pending.get("consent_nonce")
-      or _lookup_active_consent_nonce(auth_provider_name, user_id, continue_uri_with_uid)
+      or _lookup_active_consent_nonce(ALLOWED_AUTH_PROVIDER, user_id, continue_uri_with_uid)
   )
 
   finalize_url = (
       f"https://agentidentitycredentials.googleapis.com/v1/"
-      f"{auth_provider_name}/credentials:finalize"
+      f"{ALLOWED_AUTH_PROVIDER}/credentials:finalize"
   )
   body = {
       "userId": user_id,
@@ -327,13 +349,14 @@ def validate_user_id(
       timeout=30,
   )
   resp.raise_for_status()
+  safe_uid = html.escape(user_id)
 
   return f"""
     <html>
       <body style="font-family: system-ui, sans-serif; max-width: 650px; margin: 3rem auto;">
         <h2>GitHub 3LO Authorization Finalized on Cloud Run!</h2>
         <p>Google Cloud Auth Manager bound your GitHub OAuth token to user_id
-           <code>{user_id}</code> via <code>credentials:finalize</code>.</p>
+           <code>{safe_uid}</code> via <code>credentials:finalize</code>.</p>
         <p>You can now return to the <strong>Cloud Console GEAP Playground</strong> (or the
            <a href="/">SecOps Incident-to-PR UI</a>) and run
            <code>Call get_github_authenticated_user to check my GitHub user profile.</code>

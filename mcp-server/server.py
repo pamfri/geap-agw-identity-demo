@@ -10,11 +10,104 @@ Security Posture:
   IAP v2 verifies the calling agent's SPIFFE identity.
 """
 
+from contextvars import ContextVar
 from datetime import datetime, timezone
+import json
 import os
+import secrets
+import sys
+import time
 from typing import Any
 
 PORT = int(os.environ.get("PORT", "8080"))
+PROJECT_A_ID = os.environ.get("PROJECT_A_ID", os.environ.get("GOOGLE_CLOUD_PROJECT", "your-project-a-id"))
+PROJECT_B_ID = os.environ.get("PROJECT_B_ID", os.environ.get("GOOGLE_CLOUD_PROJECT", "your-project-b-id"))
+_CURRENT_TRACE_CONTEXT: ContextVar[dict[str, str]] = ContextVar("_CURRENT_TRACE_CONTEXT", default={})
+
+
+def _emit_correlated_mcp_log_and_span(
+    tool_name: str,
+    arguments: dict[str, Any],
+    start_ns: int,
+    end_ns: int,
+    status: str = "OK",
+) -> None:
+    """Emits a structured log line and OTLP child span correlated to Project A's Trace Waterfall."""
+    ctx = _CURRENT_TRACE_CONTEXT.get()
+    trace_id = ctx.get("trace_id") or secrets.token_hex(16)
+    parent_span_id = ctx.get("span_id") or ""
+    span_id = secrets.token_hex(8)
+    caller_spiffe = ctx.get("caller_spiffe", "spiffe-via-agent-gateway")
+
+    log_entry = {
+        "severity": "INFO",
+        "message": f"[INTERNAL_MCP_SERVER] Executed tool '{tool_name}' ({status})",
+        "component": "internal-secops-mcp-server",
+        "tool_name": tool_name,
+        "arguments": arguments,
+        "caller_spiffe_principal": caller_spiffe,
+        "logging.googleapis.com/trace": f"projects/{PROJECT_A_ID}/traces/{trace_id}",
+        "logging.googleapis.com/spanId": span_id,
+        "logging.googleapis.com/trace_sampled": True,
+    }
+    print(json.dumps(log_entry), file=sys.stdout, flush=True)
+
+    # Export child span to Project A's Cloud Trace via OTLP HTTP/JSON (telemetry.googleapis.com)
+    try:
+        import google.auth
+        from google.auth.transport.requests import Request
+        import httpx
+
+        creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        creds.refresh(Request())
+        span_payload: dict[str, Any] = {
+            "traceId": trace_id,
+            "spanId": span_id,
+            "name": f"mcp.tool/{tool_name}",
+            "kind": 2,  # SPAN_KIND_SERVER
+            "startTimeUnixNano": str(start_ns),
+            "endTimeUnixNano": str(end_ns),
+            "attributes": [
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}},
+                {"key": "gen_ai.tool.name", "value": {"stringValue": tool_name}},
+                {"key": "mcp.server.name", "value": {"stringValue": "internal-secops-mcp-server"}},
+                {"key": "gcp.project_id", "value": {"stringValue": PROJECT_A_ID}},
+            ],
+        }
+        if len(parent_span_id) == 16:
+            span_payload["parentSpanId"] = parent_span_id
+
+        otlp_body = {
+            "resourceSpans": [
+                {
+                    "resource": {
+                        "attributes": [
+                            {"key": "gcp.project_id", "value": {"stringValue": PROJECT_A_ID}},
+                            {"key": "service.name", "value": {"stringValue": "internal-secops-mcp-server"}},
+                            {"key": "cloud.Resource.project_id", "value": {"stringValue": PROJECT_B_ID}},
+                        ]
+                    },
+                    "scopeSpans": [
+                        {
+                            "scope": {"name": "secops.mcp.server"},
+                            "spans": [span_payload],
+                        }
+                    ],
+                }
+            ]
+        }
+        with httpx.Client(timeout=2.0) as client:
+            client.post(
+                "https://telemetry.googleapis.com/v1/traces",
+                headers={
+                    "Authorization": f"Bearer {creds.token}",
+                    "Content-Type": "application/json",
+                    "x-goog-user-project": PROJECT_A_ID,
+                },
+                json=otlp_body,
+            )
+    except Exception:
+        pass
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -132,20 +225,25 @@ def get_active_cve_alerts(service_name: str = "all") -> dict[str, Any]:
         service_name: Name of the internal service (e.g., 'payment-service',
           'checkout-worker', or 'all' to list all services).
     """
+    start_ns = time.time_ns()
     if service_name.lower() == "all":
-        return {
+        res = {
             "source": "project-b-internal-secops-scanner",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "services": _CVE_DATABASE,
         }
+        _emit_correlated_mcp_log_and_span("get_active_cve_alerts", {"service_name": service_name}, start_ns, time.time_ns())
+        return res
     alerts = _CVE_DATABASE.get(service_name, [])
-    return {
+    res = {
         "source": "project-b-internal-secops-scanner",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "service_name": service_name,
         "alert_count": len(alerts),
         "alerts": alerts,
     }
+    _emit_correlated_mcp_log_and_span("get_active_cve_alerts", {"service_name": service_name}, start_ns, time.time_ns())
+    return res
 
 
 @mcp.tool()
@@ -155,12 +253,16 @@ def get_internal_deployment_manifest(service_name: str) -> dict[str, Any]:
     Args:
         service_name: Name of the service (e.g., 'payment-service').
     """
+    start_ns = time.time_ns()
     manifest = _DEPLOYMENT_MANIFESTS.get(service_name)
     if not manifest:
-        return {
+        res = {
             "error": f"Service '{service_name}' not found in internal manifest registry.",
             "available_services": list(_DEPLOYMENT_MANIFESTS.keys()),
         }
+        _emit_correlated_mcp_log_and_span("get_internal_deployment_manifest", {"service_name": service_name}, start_ns, time.time_ns(), status="NOT_FOUND")
+        return res
+    _emit_correlated_mcp_log_and_span("get_internal_deployment_manifest", {"service_name": service_name}, start_ns, time.time_ns())
     return manifest
 
 
@@ -179,6 +281,7 @@ def record_remediation_ticket(
         github_pr_or_issue_url: Full URL of the GitHub Pull Request or Issue created via 3LO.
         remediated_by_github_user: The GitHub username of the engineer who authorized via 3LO.
     """
+    start_ns = time.time_ns()
     entry = {
         "ticket_id": f"SECOPS-REM-{len(_REMEDIATION_LEDGER) + 1001}",
         "cve_id": cve_id,
@@ -196,15 +299,79 @@ def record_remediation_ticket(
             alert["status"] = "PR_OPENED"
             alert["remediation_url"] = github_pr_or_issue_url
 
+    _emit_correlated_mcp_log_and_span(
+        "record_remediation_ticket",
+        {
+            "cve_id": cve_id,
+            "service_name": service_name,
+            "github_pr_or_issue_url": github_pr_or_issue_url,
+            "remediated_by_github_user": remediated_by_github_user,
+        },
+        start_ns,
+        time.time_ns(),
+    )
     return {
         "message": "Remediation recorded in Project B internal SecOps ledger.",
         "ledger_entry": entry,
     }
 
 
+def _wrap_asgi_with_w3c_traceparent(asgi_app: Any) -> Any:
+    """ASGI wrapper that extracts W3C traceparent / X-Cloud-Trace-Context headers from Agent Gateway."""
+    async def _wrapped(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") == "http":
+            raw_headers = {
+                k.decode("latin1").lower(): v.decode("latin1")
+                for k, v in (scope.get("headers") or [])
+            }
+            traceparent = raw_headers.get("traceparent", "")
+            x_cloud_trace = raw_headers.get("x-cloud-trace-context", "")
+            trace_id = ""
+            span_id = ""
+            if traceparent:
+                parts = traceparent.split("-")
+                if len(parts) >= 3:
+                    trace_id = parts[1]
+                    span_id = parts[2]
+            elif x_cloud_trace and "/" in x_cloud_trace:
+                t_part, s_part = x_cloud_trace.split("/", 1)
+                trace_id = t_part
+                span_offset = s_part.split(";")[0]
+                if span_offset.isdigit():
+                    span_id = f"{int(span_offset):016x}"
+            token = _CURRENT_TRACE_CONTEXT.set(
+                {
+                    "trace_id": trace_id,
+                    "span_id": span_id,
+                    "caller_spiffe": raw_headers.get(
+                        "x-goog-authenticated-user-id",
+                        raw_headers.get("x-serverless-authenticated-user-id", "spiffe-via-agent-gateway"),
+                    ),
+                }
+            )
+            try:
+                await asgi_app(scope, receive, send)
+            finally:
+                _CURRENT_TRACE_CONTEXT.reset(token)
+        else:
+            await asgi_app(scope, receive, send)
+
+    return _wrapped
+
+
 if __name__ == "__main__":
-    # Exposes Streamable HTTP MCP endpoint at /mcp on PORT (default 8080)
-    if _IS_MCP_V2:
-        mcp.run(transport="streamable-http", host="0.0.0.0", port=PORT)
-    else:
-        mcp.run(transport="streamable-http")
+    # Exposes Streamable HTTP MCP endpoint at /mcp on PORT (default 8080) with W3C traceparent extraction
+    try:
+        import uvicorn
+
+        asgi_app = mcp.streamable_http_app()
+        uvicorn.run(
+            _wrap_asgi_with_w3c_traceparent(asgi_app),
+            host="0.0.0.0",
+            port=PORT,
+        )
+    except Exception:
+        if _IS_MCP_V2:
+            mcp.run(transport="streamable-http", host="0.0.0.0", port=PORT)
+        else:
+            mcp.run(transport="streamable-http")
